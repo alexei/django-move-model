@@ -1,0 +1,186 @@
+# -*- coding: utf-8 -*-
+
+from __future__ import unicode_literals
+
+import io
+import os
+import sys
+
+from django.apps import apps
+from django.core.management.base import BaseCommand
+from django.db import migrations
+from django.db.migrations import Migration
+from django.db.migrations.autodetector import MigrationAutodetector
+from django.db.migrations.loader import MigrationLoader
+from django.db.migrations.questioner import NonInteractiveMigrationQuestioner
+from django.db.migrations.state import ProjectState
+from django.db.migrations.utils import get_migration_name_timestamp
+from django.db.migrations.writer import MigrationWriter
+
+
+class Command(BaseCommand):
+    help = 'Moves a model from one app to another'
+
+    def add_arguments(self, parser):
+        parser.add_argument('model_name', nargs='?')
+        parser.add_argument('source_app', nargs='?')
+        parser.add_argument('dest_app', nargs='?')
+
+    def handle(self, *args, **options):
+        self.model_name = options['model_name']
+        self.source_app = options['source_app']
+        self.dest_app = options['dest_app']
+
+        # make sure the apps exist
+        app_labels = set([self.source_app, self.dest_app])
+        bad_app_labels = set()
+        for app_label in app_labels:
+            try:
+                apps.get_app_config(app_label)
+            except LookupError:
+                bad_app_labels.add(app_label)
+        if bad_app_labels:
+            for app_label in bad_app_labels:
+                self.stderr.write(self.style.ERROR(
+                    "App '{}' could not be found. Is it in INSTALLED_APPS?".format(app_label)
+                ))
+            sys.exit(2)
+
+        if len(app_labels) == 1:
+            self.stderr.write(self.style.ERROR(
+                "Cannot move '{}' within the same app '{}'.".format(self.model_name, self.dest_app)
+            ))
+            sys.exit(2)
+
+        # load the current graph
+        loader = MigrationLoader(None, ignore_no_migrations=True)
+
+        questioner = NonInteractiveMigrationQuestioner(
+            specified_apps=app_labels,
+            dry_run=False,
+        )
+
+        self.from_state = loader.project_state()
+        self.to_state = ProjectState.from_apps(apps)
+
+        autodetector = MigrationAutodetector(
+            self.from_state,
+            self.to_state,
+            questioner,
+        )
+
+        rename_table = self.get_rename_table_migration()
+        create_model = self.get_create_model_migration([
+            (rename_table.app_label, rename_table.name),
+        ])
+        delete_model = self.get_delete_model_migration([
+            (rename_table.app_label, rename_table.name),
+            (create_model.app_label, create_model.name),
+        ])
+
+        changes = autodetector.arrange_for_graph(
+            changes={
+                self.source_app: [rename_table, delete_model],
+                self.dest_app: [create_model],
+            },
+            graph=loader.graph,
+        )
+        self.write_migration_files(changes)
+
+        self.stdout.write(self.style.SUCCESS("Done!"))
+
+    def get_rename_table_migration(self, dependencies=[]):
+        database_operations = []
+        state_operations = []
+
+        database_operations.append(
+            migrations.AlterModelTable(
+                self.dest_app,
+                '{}_{}'.format(self.dest_app, self.model_name.lower())
+            )
+        )
+
+        migration = Migration('rename_table', self.source_app)
+        migration.dependencies = dependencies
+        migration.operations = [
+            migrations.SeparateDatabaseAndState(
+                database_operations=database_operations,
+                state_operations=state_operations
+            )
+        ]
+        return migration
+
+    def get_create_model_migration(self, dependencies=[]):
+        database_operations = []
+        state_operations = []
+
+        model_state = self.to_state.models[self.dest_app, self.model_name.lower()]
+        model_opts = self.to_state.apps.get_model(self.dest_app, self.model_name)._meta
+        related_fields = {}
+        for field in model_opts.local_fields:
+            if field.remote_field:
+                if field.remote_field.model:
+                    if not field.remote_field.parent_link:
+                        related_fields[field.name] = field
+                if (getattr(field.remote_field, 'through', None) and
+                        not field.remote_field.through._meta.auto_created):
+                    related_fields[field.name] = field
+        for field in model_opts.local_many_to_many:
+            if field.remote_field.model:
+                related_fields[field.name] = field
+            if getattr(field.remote_field, 'through', None) and not field.remote_field.through._meta.auto_created:
+                related_fields[field.name] = field
+
+        state_operations.append(
+            migrations.CreateModel(
+                name=model_state.name,
+                fields=[d for d in model_state.fields if d[0] not in related_fields],
+                options=model_state.options,
+                bases=model_state.bases,
+                managers=model_state.managers,
+            )
+        )
+
+        migration = Migration('create_model', self.dest_app)
+        migration.dependencies = dependencies
+        migration.operations = [
+            migrations.SeparateDatabaseAndState(
+                database_operations=database_operations,
+                state_operations=state_operations,
+            )
+        ]
+        return migration
+
+    def get_delete_model_migration(self, dependencies=[]):
+        database_operations = []
+        state_operations = []
+
+        state_operations.append(migrations.DeleteModel(name=self.model_name))
+
+        migration = Migration('delete_model', self.source_app)
+        migration.dependencies = dependencies
+        migration.operations = [
+            migrations.SeparateDatabaseAndState(
+                database_operations=database_operations,
+                state_operations=state_operations,
+            )
+        ]
+        return migration
+
+
+    def write_migration_files(self, changes):
+        directory_created = {}
+        for app_label, app_migrations in changes.items():
+            for migration in app_migrations:
+                writer = MigrationWriter(migration)
+                migrations_directory = os.path.dirname(writer.path)
+                if not directory_created.get(app_label):
+                    if not os.path.isdir(migrations_directory):
+                        os.mkdir(migrations_directory)
+                    init_path = os.path.join(migrations_directory, '__init__.py')
+                    if not os.path.isfile(init_path):
+                        io.open(init_path, 'w').close()
+                    directory_created[app_label] = True
+                migration_string = writer.as_string()
+                with io.open(writer.path, 'w', encoding='utf-8') as fh:
+                    fh.write(migration_string)
