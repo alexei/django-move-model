@@ -14,7 +14,6 @@ from django.db.migrations.autodetector import MigrationAutodetector
 from django.db.migrations.loader import MigrationLoader
 from django.db.migrations.questioner import NonInteractiveMigrationQuestioner
 from django.db.migrations.state import ProjectState
-from django.db.migrations.utils import get_migration_name_timestamp
 from django.db.migrations.writer import MigrationWriter
 
 
@@ -55,10 +54,7 @@ class Command(BaseCommand):
         # load the current graph
         loader = MigrationLoader(None, ignore_no_migrations=True)
 
-        questioner = NonInteractiveMigrationQuestioner(
-            specified_apps=app_labels,
-            dry_run=False,
-        )
+        questioner = NonInteractiveMigrationQuestioner()
 
         self.from_state = loader.project_state()
         self.to_state = ProjectState.from_apps(apps)
@@ -69,33 +65,46 @@ class Command(BaseCommand):
             questioner,
         )
 
-        rename_table = self.get_rename_table_migration()
-        create_model = self.get_create_model_migration([
+        _migrations = []
+        rename_table = self._get_rename_table_migration()
+        _migrations.append(rename_table)
+        create_model = self._get_create_model_migration([
             (rename_table.app_label, rename_table.name),
         ])
-        delete_model = self.get_delete_model_migration([
-            (rename_table.app_label, rename_table.name),
+        _migrations.append(create_model)
+        model_fk = self._get_model_fk_migrations([
             (create_model.app_label, create_model.name),
         ])
+        delete_model_deps = [
+            (rename_table.app_label, rename_table.name),
+            (create_model.app_label, create_model.name),
+        ]
+        for fk_migration in model_fk:
+            _migrations.append(fk_migration)
+            delete_model_deps.append(
+                (fk_migration.app_label, fk_migration.name),
+            )
+        delete_model = self._get_delete_model_migration(delete_model_deps)
+        _migrations.append(delete_model)
 
+        changes = {}
+        for migration in _migrations:
+            changes.setdefault(migration.app_label, []).append(migration)
         changes = autodetector.arrange_for_graph(
-            changes={
-                self.source_app: [rename_table, delete_model],
-                self.dest_app: [create_model],
-            },
+            changes=changes,
             graph=loader.graph,
         )
         self.write_migration_files(changes)
 
         self.stdout.write(self.style.SUCCESS("Done!"))
 
-    def get_rename_table_migration(self, dependencies=[]):
+    def _get_rename_table_migration(self, dependencies=[]):
         database_operations = []
         state_operations = []
 
         database_operations.append(
             migrations.AlterModelTable(
-                self.dest_app,
+                self.model_name.lower(),
                 '{}_{}'.format(self.dest_app, self.model_name.lower())
             )
         )
@@ -110,7 +119,7 @@ class Command(BaseCommand):
         ]
         return migration
 
-    def get_create_model_migration(self, dependencies=[]):
+    def _get_create_model_migration(self, dependencies=[]):
         database_operations = []
         state_operations = []
 
@@ -151,7 +160,31 @@ class Command(BaseCommand):
         ]
         return migration
 
-    def get_delete_model_migration(self, dependencies=[]):
+    def _get_model_fk_migrations(self, dependencies=[]):
+        _migrations = []
+
+        model_state = self.to_state.models[self.dest_app, self.model_name.lower()]
+        model_opts = self.to_state.apps.get_model(self.dest_app, self.model_name)._meta
+
+        for field in model_opts.get_fields(include_hidden=True):
+            if field.is_relation:
+                operations = []
+                operations.append(
+                    migrations.AlterField(
+                        model_name=field.related_model._meta.model_name,
+                        name=field.remote_field.name,
+                        field=field.remote_field,
+                    )
+                )
+                migration = Migration('alter_model_fk', field.related_model._meta.app_label)
+                migration.dependencies = dependencies
+                migration.operations = operations
+
+                _migrations.append(migration)
+
+        return _migrations
+
+    def _get_delete_model_migration(self, dependencies=[]):
         database_operations = []
         state_operations = []
 
