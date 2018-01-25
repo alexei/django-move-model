@@ -163,7 +163,6 @@ class Command(BaseCommand):
     def _get_model_fk_migrations(self, dependencies=[]):
         _migrations = []
 
-        model_state = self.to_state.models[self.dest_app, self.model_name.lower()]
         model_opts = self.to_state.apps.get_model(self.dest_app, self.model_name)._meta
 
         for field in model_opts.get_fields(include_hidden=True):
